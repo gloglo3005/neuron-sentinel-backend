@@ -10,9 +10,34 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 export const app = express();
 
 app.use(helmet());
-// CORS is locked to the dashboard's own origin — this API is not a public
-// API, it exists to serve one authenticated authority dashboard.
-app.use(cors({ origin: env.corsOrigin, credentials: true }));
+// CORS is locked to a known set of origins — this API is not a public API.
+// env.corsOrigin holds the fixed origins (localhost dev ports + the main
+// production Vercel URL). On top of that we also accept any Vercel
+// *preview* deployment URL for this project (e.g.
+// https://neuron-sentinel-83oqbmgj0-glorie.vercel.app), since Vercel mints
+// a new one on every preview build and we don't want to hand-edit
+// CORS_ORIGIN each time. Adjust the regex below if the project name/slug
+// on Vercel ever changes.
+const VERCEL_PREVIEW_REGEX = /^https:\/\/neuron-sentinel-[a-z0-9]+-glorie\.vercel\.app$/;
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // non-browser requests (curl, server-to-server, health checks)
+  if (env.corsOrigin.includes(origin)) return true;
+  return VERCEL_PREVIEW_REGEX.test(origin);
+}
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Origin ${origin} not allowed by CORS`));
+      }
+    },
+    credentials: true,
+  }),
+);
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan(env.nodeEnv === 'development' ? 'dev' : 'combined'));
 app.use('/api', apiLimiter);
