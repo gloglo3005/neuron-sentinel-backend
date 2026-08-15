@@ -1,0 +1,454 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                  String                        @id @default(cuid())
+  name                String
+  phone               String                        @unique
+  email               String?                       @unique
+  passwordHash        String
+  role                Role
+  assignedZoneId      String?
+  isActive            Boolean                       @default(true)
+  canWrite            Boolean                       @default(true)
+  failedLoginAttempts Int                           @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+  // Citizen geolocation (PWA — spec section 6). Reuses assignedZoneId above
+  // as "current zone" for CITIZEN accounts too (same field, same meaning:
+  // the zone this user is currently associated with) instead of adding a
+  // parallel column. lastLatitude/lastLongitude/locationUpdatedAt let the
+  // PWA show "data as of <time>" and avoid re-resolving the zone on every
+  // request (spec section 16 — don't ask for GPS continuously).
+  lastLatitude        Float?
+  lastLongitude       Float?
+  locationUpdatedAt   DateTime?
+  twoFactorEnabled    Boolean                       @default(false)
+  twoFactorSecret     String?
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @updatedAt
+  createdAlerts       Alert[]                       @relation("AlertCreatedBy")
+  validatedAlerts     Alert[]                       @relation("AlertValidatedBy")
+  alertEvents         AlertEvent[]
+  auditLogs           AuditLog[]
+  verifiedDamage      DamageReport[]                @relation("DamageVerifiedBy")
+  verifiedEvents      EmergencyEvent[]              @relation("EmergencyEventVerifiedBy")
+  reportedIncidents   IncidentReport[]              @relation("IncidentReportedBy")
+  verifiedIncidents   IncidentReport[]              @relation("IncidentVerifiedBy")
+  notificationAcks    NotificationAcknowledgement[]
+  assignedZone        Zone?                         @relation("UserAssignedZone", fields: [assignedZoneId], references: [id])
+
+  @@index([assignedZoneId])
+  @@index([role])
+}
+
+model Zone {
+  id              String                 @id @default(cuid())
+  name            String                 @unique
+  code            String                 @unique
+  latitude        Float
+  longitude       Float
+  geometry        Json?
+  population      Int
+  riskLevel       RiskLevel              @default(LOW)
+  drainScore      Float                  @default(50)
+  historyScore    Float                  @default(20)
+  rainScore       Float                  @default(30)
+  radius          Int                    @default(800)
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  alertZones      AlertZone[]
+  environmental   EnvironmentalData[]
+  incidentReports IncidentReport[]
+  infrastructures Infrastructure[]
+  interventions   Intervention[]
+  predictions     Prediction[]
+  satelliteObs    SatelliteObservation[]
+  assignedUsers   User[]                 @relation("UserAssignedZone")
+}
+
+model EnvironmentalData {
+  id          String   @id @default(cuid())
+  zoneId      String
+  source      String
+  timestamp   DateTime @default(now())
+  rainfall    Float
+  temperature Float?
+  humidity    Float?
+  windSpeed   Float?
+  forecast    Json?
+  rawData     Json?
+  createdAt   DateTime @default(now())
+  zone        Zone     @relation(fields: [zoneId], references: [id])
+
+  @@index([zoneId, timestamp])
+}
+
+model SatelliteObservation {
+  id             String   @id @default(cuid())
+  zoneId         String
+  source         String   @default("MOCK")
+  observedAt     DateTime @default(now())
+  floodIndicator Boolean
+  waterExtent    Float?
+  confidence     Float
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  zone           Zone     @relation(fields: [zoneId], references: [id])
+
+  @@index([zoneId, observedAt])
+}
+
+model Prediction {
+  id           String             @id @default(cuid())
+  zoneId       String
+  horizon      Int
+  probability  Float
+  riskLevel    RiskLevel
+  confidence   Float
+  modelVersion String
+  generatedAt  DateTime           @default(now())
+  validUntil   DateTime?
+  status       String             @default("ACTIVE")
+  alerts       Alert[]
+  zone         Zone               @relation(fields: [zoneId], references: [id])
+  factors      PredictionFactor[]
+  outcome      PredictionOutcome?
+
+  @@index([zoneId, generatedAt])
+}
+
+model PredictionFactor {
+  id           String     @id @default(cuid())
+  predictionId String
+  factor       String
+  value        Float
+  contribution Float
+  prediction   Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+
+  @@index([predictionId])
+}
+
+model PredictionOutcome {
+  id                 String             @id @default(cuid())
+  predictionId       String             @unique
+  actualEvent        Boolean
+  actualRiskLevel    RiskLevel?
+  observedAt         DateTime           @default(now())
+  verificationStatus VerificationStatus @default(UNKNOWN)
+  notes              String?
+  prediction         Prediction         @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+}
+
+model Alert {
+  id              String         @id @default(cuid())
+  title           String
+  description     String?
+  type            String
+  severity        RiskLevel
+  status          AlertStatus    @default(PROPOSED)
+  source          AlertSource
+  predictionId    String?
+  createdById     String
+  validatedById   String?
+  rejectionReason String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  validatedAt     DateTime?
+  dispatchedAt    DateTime?
+  resolvedAt      DateTime?
+  closedAt        DateTime?
+  createdBy       User           @relation("AlertCreatedBy", fields: [createdById], references: [id])
+  prediction      Prediction?    @relation(fields: [predictionId], references: [id])
+  validatedBy     User?          @relation("AlertValidatedBy", fields: [validatedById], references: [id])
+  events          AlertEvent[]
+  zones           AlertZone[]
+  interventions   Intervention[]
+  notifications   Notification[]
+
+  @@index([status])
+}
+
+model AlertZone {
+  alertId String
+  zoneId  String
+  alert   Alert  @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  zone    Zone   @relation(fields: [zoneId], references: [id])
+
+  @@id([alertId, zoneId])
+  @@index([zoneId])
+}
+
+model AlertEvent {
+  id        String          @id @default(cuid())
+  alertId   String
+  userId    String?
+  action    AlertActionType
+  details   String?
+  timestamp DateTime        @default(now())
+  alert     Alert           @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  user      User?           @relation(fields: [userId], references: [id])
+
+  @@index([alertId, timestamp])
+}
+
+model Notification {
+  id               String                        @id @default(cuid())
+  alertId          String
+  channel          NotificationChannel
+  recipient        String
+  status           NotificationStatus            @default(PENDING)
+  sentAt           DateTime?
+  deliveredAt      DateTime?
+  errorMessage     String?
+  alert            Alert                         @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  acknowledgements NotificationAcknowledgement[]
+
+  @@index([alertId])
+}
+
+model NotificationAcknowledgement {
+  id             String       @id @default(cuid())
+  notificationId String
+  userId         String
+  status         AckStatus
+  acknowledgedAt DateTime     @default(now())
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id])
+
+  @@index([notificationId])
+}
+
+model IncidentReport {
+  id              String           @id @default(cuid())
+  reportedById    String?
+  type            String
+  description     String?
+  latitude        Float
+  longitude       Float
+  zoneId          String?
+  status          String           @default("PENDING")
+  confidence      Float?
+  createdAt       DateTime         @default(now())
+  verifiedAt      DateTime?
+  verifiedById    String?
+  emergencyEvents EmergencyEvent[]
+  media           IncidentMedia[]
+  reportedBy      User?            @relation("IncidentReportedBy", fields: [reportedById], references: [id])
+  verifiedBy      User?            @relation("IncidentVerifiedBy", fields: [verifiedById], references: [id])
+  zone            Zone?            @relation(fields: [zoneId], references: [id])
+
+  @@index([zoneId])
+  @@index([status])
+}
+
+model IncidentMedia {
+  id                 String             @id @default(cuid())
+  incidentId         String
+  type               String
+  url                String
+  verificationStatus VerificationStatus @default(UNKNOWN)
+  metadata           Json?
+  createdAt          DateTime           @default(now())
+  incident           IncidentReport     @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId])
+}
+
+model EmergencyEvent {
+  id            String          @id @default(cuid())
+  title         String
+  type          String
+  description   String?
+  startAt       DateTime
+  endAt         DateTime?
+  severity      RiskLevel
+  verified      Boolean         @default(false)
+  verifiedById  String?
+  incidentId    String?
+  damageReports DamageReport[]
+  incident      IncidentReport? @relation(fields: [incidentId], references: [id])
+  verifiedBy    User?           @relation("EmergencyEventVerifiedBy", fields: [verifiedById], references: [id])
+}
+
+model Team {
+  id               String             @id @default(cuid())
+  name             String
+  type             String
+  status           TeamStatus         @default(AVAILABLE)
+  currentLatitude  Float?
+  currentLongitude Float?
+  interventions    InterventionTeam[]
+}
+
+model Intervention {
+  id          String             @id @default(cuid())
+  alertId     String?
+  zoneId      String
+  mission     String
+  status      InterventionStatus @default(PLANNED)
+  startedAt   DateTime?
+  completedAt DateTime?
+  result      String?
+  alert       Alert?             @relation(fields: [alertId], references: [id])
+  zone        Zone               @relation(fields: [zoneId], references: [id])
+  teams       InterventionTeam[]
+
+  @@index([zoneId])
+}
+
+model InterventionTeam {
+  interventionId String
+  teamId         String
+  assignedAt     DateTime     @default(now())
+  departedAt     DateTime?
+  arrivedAt      DateTime?
+  status         TeamStatus   @default(DISPATCHED)
+  intervention   Intervention @relation(fields: [interventionId], references: [id], onDelete: Cascade)
+  team           Team         @relation(fields: [teamId], references: [id])
+
+  @@id([interventionId, teamId])
+}
+
+model Infrastructure {
+  id            String             @id @default(cuid())
+  zoneId        String
+  name          String
+  type          InfrastructureType
+  latitude      Float
+  longitude     Float
+  status        String             @default("OPERATIONAL")
+  damageReports DamageReport[]
+  zone          Zone               @relation(fields: [zoneId], references: [id])
+
+  @@index([zoneId])
+}
+
+model DamageReport {
+  id               String          @id @default(cuid())
+  emergencyEventId String?
+  infrastructureId String?
+  type             String
+  quantity         Float?
+  severity         RiskLevel
+  source           String
+  verified         Boolean         @default(false)
+  verifiedById     String?
+  createdAt        DateTime        @default(now())
+  emergencyEvent   EmergencyEvent? @relation(fields: [emergencyEventId], references: [id])
+  infrastructure   Infrastructure? @relation(fields: [infrastructureId], references: [id])
+  verifiedBy       User?           @relation("DamageVerifiedBy", fields: [verifiedById], references: [id])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+  user       User?    @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+enum Role {
+  ADMIN
+  AUTHORITY
+  CIVIL_PROTECTION
+  EMERGENCY_SERVICE
+  CITIZEN
+}
+
+enum RiskLevel {
+  LOW
+  MODERATE
+  HIGH
+  CRITICAL
+}
+
+enum VerificationStatus {
+  UNKNOWN
+  LIKELY_AUTHENTIC
+  POTENTIALLY_MANIPULATED
+  REQUIRES_HUMAN_REVIEW
+}
+
+enum AlertStatus {
+  PROPOSED
+  UNDER_REVIEW
+  CONFIRMED
+  DISPATCHED
+  ACTIVE
+  RESOLVED
+  CLOSED
+}
+
+enum AlertSource {
+  PREDICTION
+  MANUAL
+}
+
+enum AlertActionType {
+  CREATED
+  SUBMITTED
+  REVIEWED
+  CONFIRMED
+  REJECTED
+  VERIFICATION_REQUESTED
+  DISPATCHED
+  FIELD_ENGAGED
+  RESOLVED
+  CLOSED
+}
+
+enum NotificationChannel {
+  SMS
+  PUSH
+  DASHBOARD
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum AckStatus {
+  RECEIVED
+  ACKNOWLEDGED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum TeamStatus {
+  AVAILABLE
+  DISPATCHED
+  ON_SITE
+  RETURNING
+  OFF_DUTY
+}
+
+enum InterventionStatus {
+  PLANNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum InfrastructureType {
+  ROAD
+  HOSPITAL
+  SCHOOL
+  BRIDGE
+  BUSINESS
+  OTHER
+}
