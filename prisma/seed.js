@@ -93,6 +93,11 @@ const ZONES = [
     rain: 61,
     radius: 800,
   },
+  { name: 'Hédzranawoé', code: 'HED', lat: 6.185, lng: 1.2484, pop: 26000, drain: 55, hist: 48, rain: 52, radius: 1500 },
+  { name: 'Nyékonakpoè', code: 'NYE', lat: 6.1302, lng: 1.2059, pop: 8200, drain: 65, hist: 25, rain: 35, radius: 1060 },
+  { name: 'Akodesséwa', code: 'AKO', lat: 6.1536, lng: 1.2673, pop: 9800, drain: 40, hist: 55, rain: 58, radius: 1500 },
+  { name: 'Doulassamé', code: 'DOU', lat: 6.1402, lng: 1.227, pop: 6700, drain: 55, hist: 35, rain: 45, radius: 805 },
+  { name: 'Hanoukopé', code: 'HAN', lat: 6.1378, lng: 1.2186, pop: 7100, drain: 52, hist: 38, rain: 48, radius: 492 },
 ];
 
 function riskLevelOf(probability) {
@@ -243,6 +248,11 @@ async function main() {
     'Adidogomé': [15, 17, 19, 14, 10],
     'Agoè': [20, 23, 26, 20, 14],
     Baguida: [84, 90, 95, 88, 55],
+    'Hédzranawoé': [32, 38, 44, 37, 24],
+    'Nyékonakpoè': [22, 26, 30, 23, 15],
+    'Akodesséwa': [40, 48, 55, 46, 30],
+    'Doulassamé': [28, 32, 38, 32, 20],
+    'Hanoukopé': [29, 34, 40, 33, 21],
   };
 
   const horizons = [0, 6, 12, 24, 48];

@@ -42,6 +42,12 @@ export function alertSummaryDto(alert) {
     zones: (alert.zones || []).map((z) => z.zone?.name ?? z.name).filter(Boolean),
     dispatchedAt: alert.dispatchedAt,
     resolvedAt: alert.resolvedAt,
+    // Set by citizenController before calling this dto (see
+    // attachAcknowledged) — whether *this* citizen has already
+    // acknowledged this alert. Defaults to false so callers that don't
+    // bother attaching it (there are none left, but just in case) don't
+    // crash the PWA.
+    acknowledged: alert.acknowledged ?? false,
   };
 }
 

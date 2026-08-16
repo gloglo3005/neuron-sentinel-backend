@@ -1,5 +1,6 @@
 import { prisma } from '../config/db.js';
 import { asyncHandler, HttpError } from '../utils/asyncHandler.js';
+import { emit } from '../realtime/io.js';
 
 const include = { zone: { select: { name: true } }, teams: { include: { team: true } } };
 
@@ -29,6 +30,13 @@ export const createIntervention = asyncHandler(async (req, res) => {
     },
     include,
   });
+  // Matches the event list already documented in src/realtime/io.js
+  // ("Events emitted so far: ... intervention.updated") — creation and
+  // status changes are both "intervention.updated" from a client's point
+  // of view (there's no separate "intervention.created" listener anywhere
+  // in the frontend, so one event name keeps this simple, per spec section
+  // 14: don't add complexity that isn't needed).
+  emit('intervention.updated', intervention);
   res.status(201).json(intervention);
 });
 
@@ -39,5 +47,6 @@ export const updateInterventionStatus = asyncHandler(async (req, res) => {
   if (status === 'IN_PROGRESS') data.startedAt = new Date();
   if (status === 'COMPLETED') { data.completedAt = new Date(); data.result = result; }
   const intervention = await prisma.intervention.update({ where: { id: req.params.id }, data, include });
+  emit('intervention.updated', intervention);
   res.json(intervention);
 });

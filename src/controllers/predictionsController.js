@@ -1,6 +1,7 @@
 import { prisma } from '../config/db.js';
 import { asyncHandler, HttpError } from '../utils/asyncHandler.js';
 import { aiService } from '../services/aiService.js';
+import { emit } from '../realtime/io.js';
 
 // GET /api/predictions?zoneId=&horizon=
 export const listPredictions = asyncHandler(async (req, res) => {
@@ -63,6 +64,19 @@ export const generatePrediction = asyncHandler(async (req, res) => {
     },
     include: { factors: true },
   });
+
+  // Zone.riskLevel is the field the dashboard summary (criticalZones/
+  // highRiskZones KPIs — see dashboardController.js) and the citizen PWA's
+  // zone card fallback (zoneSummaryDto) both read. Without this update it
+  // stays frozen at whatever seed.js set it to, even as fresh predictions
+  // come in — the two numbers would silently drift apart. Keep it in sync
+  // with the zone's most recently generated prediction.
+  await prisma.zone.update({ where: { id: zone.id }, data: { riskLevel: result.riskLevel } });
+
+  // Matches the event list already documented in src/realtime/io.js
+  // ("Events emitted so far: ... prediction.updated") and spec section 14
+  // — this was the one controller that didn't actually emit it yet.
+  emit('prediction.updated', prediction);
 
   res.status(201).json(prediction);
 });

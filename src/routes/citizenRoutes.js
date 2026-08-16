@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { register, login, me } from '../controllers/citizenAuthController.js';
 import {
-  updateLocation, getCurrentZone, listAlertsForCitizen, createReport, listMyReports,
+  updateLocation, getCurrentZone, listAlertsForCitizen, acknowledgeAlert, createReport, listMyReports,
 } from '../controllers/citizenController.js';
 import { requireAuth, requireCitizenAccess } from '../middleware/auth.js';
 import { loginLimiter } from '../middleware/rateLimit.js';
@@ -21,6 +21,7 @@ router.get('/auth/me', me);
 router.post('/location', validate(locationSchema), updateLocation);
 router.get('/zone/current', getCurrentZone);
 router.get('/alerts', listAlertsForCitizen);
+router.post('/alerts/:alertId/acknowledge', acknowledgeAlert);
 router.post('/reports', validate(createReportSchema), createReport);
 router.get('/reports/mine', listMyReports);
 

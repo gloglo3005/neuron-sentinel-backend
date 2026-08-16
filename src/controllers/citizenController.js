@@ -41,6 +41,23 @@ async function requireCitizenZone(req) {
   return prisma.zone.findUnique({ where: { id: user.assignedZoneId } });
 }
 
+// Marks each alert with whether the current citizen has already
+// acknowledged it (NotificationAcknowledgement — modeled in schema.prisma
+// but never actually wired up until now, see acknowledgeAlert below).
+// Mutates the alert objects in place so callers can just pass them
+// straight into alertSummaryDto/zoneSummaryDto afterwards.
+async function attachAcknowledged(userId, alerts) {
+  const list = alerts.filter(Boolean);
+  if (!list.length) return alerts;
+  const acks = await prisma.notificationAcknowledgement.findMany({
+    where: { userId, notification: { alertId: { in: list.map((a) => a.id) } } },
+    select: { notification: { select: { alertId: true } } },
+  });
+  const ackedIds = new Set(acks.map((a) => a.notification.alertId));
+  for (const a of list) a.acknowledged = ackedIds.has(a.id);
+  return alerts;
+}
+
 // GET /api/citizen/zone/current
 // The PWA home screen (spec section 7): zone, weather, risk, active alert
 // — one call, everything the citizen needs, nothing they don't (no raw AI
@@ -58,6 +75,7 @@ export const getCurrentZone = asyncHandler(async (req, res) => {
       orderBy: { dispatchedAt: 'desc' },
     }),
   ]);
+  if (alert) await attachAcknowledged(req.user.id, [alert]);
 
   res.json(zoneSummaryDto(zone, { environmental, prediction, alert }));
 });
@@ -81,8 +99,56 @@ export const listAlertsForCitizen = asyncHandler(async (req, res) => {
     orderBy: { dispatchedAt: 'desc' },
     take: 20,
   });
+  await attachAcknowledged(req.user.id, alerts);
 
   res.json(alerts.map(alertSummaryDto));
+});
+
+// POST /api/citizen/alerts/:alertId/acknowledge
+// Closes the loop on NotificationAcknowledgement, which existed in the
+// schema (and was listed as an existing feature in spec section 5) but
+// had no route/controller anywhere — "accusé de réception" was a table,
+// not a feature. An alert is broadcast (Notification.recipient ===
+// 'BROADCAST', see alertsController.dispatchAlert) rather than fanned out
+// per citizen, so there's one Notification row per channel (SMS, PUSH…)
+// for the whole alert; acknowledging the alert acknowledges all of them
+// for this citizen, which is what the PWA actually needs to show ("vu").
+export const acknowledgeAlert = asyncHandler(async (req, res) => {
+  const zone = await requireCitizenZone(req);
+  if (!zone) throw new HttpError(404, 'Zone introuvable.');
+
+  const alert = await prisma.alert.findFirst({
+    where: { id: req.params.alertId, zones: { some: { zoneId: zone.id } } },
+    include: { notifications: true },
+  });
+  if (!alert) throw new HttpError(404, "Alerte introuvable pour votre zone.");
+  if (!['DISPATCHED', 'ACTIVE', 'RESOLVED'].includes(alert.status)) {
+    throw new HttpError(409, "Cette alerte n'a pas encore été diffusée — rien à confirmer pour le moment.");
+  }
+  if (!alert.notifications.length) {
+    // Defensive only — dispatchAlert always creates Notification rows
+    // before an alert can reach DISPATCHED, so this shouldn't happen.
+    throw new HttpError(409, 'Aucune notification associée à cette alerte.');
+  }
+
+  // No @@unique([notificationId, userId]) on NotificationAcknowledgement
+  // in schema.prisma, so this does a manual check-then-create instead of
+  // an upsert. A double-tap race is possible in theory but harmless here
+  // (duplicate ack rows, not a correctness issue for a "seen" flag) —
+  // not worth a schema migration for (spec section 32: don't touch Prisma
+  // unless truly necessary).
+  for (const notification of alert.notifications) {
+    const existing = await prisma.notificationAcknowledgement.findFirst({
+      where: { notificationId: notification.id, userId: req.user.id },
+    });
+    if (!existing) {
+      await prisma.notificationAcknowledgement.create({
+        data: { notificationId: notification.id, userId: req.user.id, status: 'ACKNOWLEDGED' },
+      });
+    }
+  }
+
+  res.json({ success: true, acknowledgedAt: new Date().toISOString() });
 });
 
 // POST /api/citizen/reports  { type, description, latitude, longitude, media }
