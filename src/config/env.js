@@ -30,4 +30,5 @@ export const env = {
   smsApiSecret: process.env.SMS_API_SECRET || '',
   smsSender: process.env.SMS_SENDER || 'NeuronSentinel',
   aiApiKey: process.env.AI_API_KEY || '',
+  aiApiUrl: process.env.AI_API_URL || '',
 };
