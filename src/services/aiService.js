@@ -31,17 +31,30 @@ function clamp(v, min = 0, max = 100) {
   return Math.max(min, Math.min(max, v));
 }
 
-// Normalizes whatever casing/wording the remote API uses for risk_level
-// into our RiskLevel enum (LOW/MODERATE/HIGH/CRITICAL — see
-// prisma/schema.prisma). Falls back to a probability-based guess if the
-// value doesn't match anything recognized, rather than letting an
-// unexpected string crash the Prisma insert.
-function normalizeRiskLevel(rawLevel, probability) {
+// Normalizes whatever casing the remote API uses for risk_level (only
+// ever "high" or "low" per the teammate's model — it's a binary
+// classifier, no medium/critical tiers). Only used as a sanity check
+// against our own probability-derived tier below — never as the value we
+// store, since it can't represent MODERATE/CRITICAL at all.
+function normalizeBinaryLabel(rawLevel) {
   const key = String(rawLevel || '').trim().toUpperCase();
-  const known = ['LOW', 'MODERATE', 'HIGH', 'CRITICAL'];
-  if (known.includes(key)) return key;
-  const synonyms = { MINIMAL: 'LOW', MEDIUM: 'MODERATE', SEVERE: 'CRITICAL', EXTREME: 'CRITICAL' };
-  if (synonyms[key]) return synonyms[key];
+  return key === 'HIGH' || key === 'LOW' ? key : null;
+}
+
+// Single source of truth for the LOW/MODERATE/HIGH/CRITICAL tiers (see
+// RiskLevel enum, prisma/schema.prisma) — used by both providers so a
+// zone's riskLevel always reflects its actual probability, regardless of
+// which model produced it.
+//
+// This exists because the remote model's own risk_level is a binary
+// high/low classification (per teammate) — trusting it directly would
+// flatten every zone into just HIGH or LOW forever, so a 95% probability
+// zone and a 56% one would carry the identical badge, and
+// dashboardController's `criticalZones` count (zones.riskLevel ===
+// 'CRITICAL') would never increment even during a severe event. Deriving
+// the tier from the continuous probability instead keeps that
+// granularity regardless of which provider produced the number.
+function riskTierOf(probability) {
   return probability >= 80 ? 'CRITICAL' : probability >= 55 ? 'HIGH' : probability >= 30 ? 'MODERATE' : 'LOW';
 }
 
@@ -110,8 +123,19 @@ export const aiService = {
       // guessing wrong silently.
       const rawProbability = Number(remote.flood_probability) || 0;
       const probability = Math.round(clamp(rawProbability <= 1 ? rawProbability * 100 : rawProbability));
-      const riskLevel = normalizeRiskLevel(remote.risk_level, probability);
+      const riskLevel = riskTierOf(probability);
       const confidence = estimateConfidence(probability, horizon);
+
+      // Sanity check only, never overrides riskLevel above — if the
+      // teammate's binary classifier disagrees sharply with our
+      // probability-derived tier (e.g. it says "low" at 70%+), that's
+      // worth knowing about even though we don't act on it here.
+      const binaryLabel = normalizeBinaryLabel(remote.risk_level);
+      if (binaryLabel === 'LOW' && probability >= 55) {
+        console.warn(`[aiService] Zone ${zone.id}: remote model says LOW but probability is ${probability}% (tier ${riskLevel})`);
+      } else if (binaryLabel === 'HIGH' && probability < 30) {
+        console.warn(`[aiService] Zone ${zone.id}: remote model says HIGH but probability is only ${probability}% (tier ${riskLevel})`);
+      }
 
       return {
         modelVersion: REMOTE_MODEL_VERSION,
@@ -140,7 +164,7 @@ export const aiService = {
     const probability = clamp(base + rainContribution + drainContribution + histContribution + horizonPenalty);
     const confidence = clamp(96 - horizonPenalty * 1.5 - Math.abs(rainContribution - 20) * 0.1, 40, 99);
 
-    const riskLevel = probability >= 80 ? 'CRITICAL' : probability >= 55 ? 'HIGH' : probability >= 30 ? 'MODERATE' : 'LOW';
+    const riskLevel = riskTierOf(probability);
 
     return {
       modelVersion: MODEL_VERSION_MOCK,
