@@ -1,144 +1,274 @@
 import { env } from '../config/env.js';
 
 // AIProvider interface (spec section 28): generatePrediction(zone, envData).
+//
 // MOCK_MODEL_V1 is a simple, fully transparent scoring function — not a
-// real ML model — used so the rest of the system (PredictionFactor,
-// AIPredictions.jsx waterfall) has real, internally-consistent numbers to
-// work with while a real inference service isn't connected.
+// real ML model — used as a fallback so the rest of the system can continue
+// working when the remote inference service is unavailable.
 const MODEL_VERSION_MOCK = 'MOCK_MODEL_V1';
 
-// Real provider: teammate's FastAPI service (Railway). Contract confirmed
-// against its live /openapi.json on 2026-08-17:
-//   POST {AI_API_URL}/predict
-//   body: { zone_id, rainfall_1h, rainfall_6h, humidity }
-//   200:  { zone_id, flood_probability, risk_level, prediction_horizon }
+// Real provider: teammate's FastAPI service.
 //
-// Two gaps between that contract and what this system needs — both called
-// out explicitly below rather than silently patched over (spec section 33
-// — never present fabricated data as real):
-//   1. The API returns no `confidence`. Prediction.confidence is a
-//      required, non-nullable column, so we compute a stand-in and label
-//      it ESTIMATED_CONFIDENCE_HEURISTIC in modelVersion so it's traceable
-//      in the data itself, not just in a code comment.
-//   2. The API wants `rainfall_6h`, but EnvironmentalData only stores a
-//      single point-in-time `rainfall` reading, no rolling 6h sum yet.
-//      Approximated here as rainfall_1h * 6 — a flat extrapolation, not an
-//      actual accumulation. Revisit once EnvironmentalData aggregation
-//      exists (e.g. summing the last 6 hourly rows for the zone).
-const REMOTE_MODEL_VERSION = 'NEURON_SENTINEL_REMOTE_v0.1_ESTIMATED_CONFIDENCE_HEURISTIC';
+// Contract:
+//   POST {AI_API_URL}/predict
+//
+// Body:
+//   {
+//     zone_id,
+//     rainfall_1h,
+//     rainfall_6h,
+//     humidity
+//   }
+//
+// IMPORTANT:
+// The remote API expects `zone_id` to contain the zone/canton name used by
+// the AI dataset (canton_nom), NOT our local Prisma Zone.id.
+//
+// Example:
+//   local Prisma ID: "cmsqju7290004domk36uafny6"
+//   local zone name: "Bè"
+//   remote zone_id:  "Bè"
+//
+// The previous implementation incorrectly sent zone.id, which caused:
+//   404 — "Zone inconnue: cmsqju7290004domk36uafny6"
+//
+// The remote API response is expected to contain:
+//   {
+//     zone_id,
+//     flood_probability,
+//     risk_level,
+//     prediction_horizon
+//   }
+//
+// The remote API does not currently return `confidence`, so this service
+// computes an explicitly labelled heuristic confidence value.
+//
+// It also expects rainfall_6h while EnvironmentalData currently stores
+// only a point-in-time rainfall value. Until a real rolling 6h aggregation
+// exists, rainfall_6h is approximated as rainfall_1h * 6.
+const REMOTE_MODEL_VERSION =
+  'NEURON_SENTINEL_REMOTE_v0.1_ESTIMATED_CONFIDENCE_HEURISTIC';
 
 function clamp(v, min = 0, max = 100) {
   return Math.max(min, Math.min(max, v));
 }
 
-// Normalizes whatever casing the remote API uses for risk_level (only
-// ever "high" or "low" per the teammate's model — it's a binary
-// classifier, no medium/critical tiers). Only used as a sanity check
-// against our own probability-derived tier below — never as the value we
-// store, since it can't represent MODERATE/CRITICAL at all.
+// Normalizes the binary risk label returned by the remote model.
+// The remote model currently returns only HIGH or LOW.
+// This is used only as a sanity check; the final risk level stored by our
+// backend is derived from the continuous flood probability.
 function normalizeBinaryLabel(rawLevel) {
   const key = String(rawLevel || '').trim().toUpperCase();
+
   return key === 'HIGH' || key === 'LOW' ? key : null;
 }
 
-// Single source of truth for the LOW/MODERATE/HIGH/CRITICAL tiers (see
-// RiskLevel enum, prisma/schema.prisma) — used by both providers so a
-// zone's riskLevel always reflects its actual probability, regardless of
-// which model produced it.
+// Single source of truth for our four risk tiers.
 //
-// This exists because the remote model's own risk_level is a binary
-// high/low classification (per teammate) — trusting it directly would
-// flatten every zone into just HIGH or LOW forever, so a 95% probability
-// zone and a 56% one would carry the identical badge, and
-// dashboardController's `criticalZones` count (zones.riskLevel ===
-// 'CRITICAL') would never increment even during a severe event. Deriving
-// the tier from the continuous probability instead keeps that
-// granularity regardless of which provider produced the number.
+// The remote model uses a binary HIGH/LOW classification, but our dashboard
+// needs LOW/MODERATE/HIGH/CRITICAL. Therefore we derive the final tier from
+// the continuous probability returned by the remote model.
 function riskTierOf(probability) {
-  return probability >= 80 ? 'CRITICAL' : probability >= 55 ? 'HIGH' : probability >= 30 ? 'MODERATE' : 'LOW';
+  return probability >= 80
+    ? 'CRITICAL'
+    : probability >= 55
+      ? 'HIGH'
+      : probability >= 30
+        ? 'MODERATE'
+        : 'LOW';
 }
 
-// The remote model gives no uncertainty estimate at all. This heuristic is
-// NOT a real confidence score — it's a rough proxy: predictions near 0 or
-// 100 (unambiguous) score higher than predictions near 50 (ambiguous), and
-// longer horizons score lower (more time for conditions to change). It
-// exists only so Prediction.confidence (required column) isn't a made-up
-// constant, and it's clearly named as an estimate in MODEL_VERSION so it
-// never gets mistaken for a real model output.
+// The remote model does not provide an uncertainty/confidence score.
+// This is therefore only a transparent heuristic and must never be
+// presented as an actual model confidence.
 function estimateConfidence(probability, horizon) {
-  const decisiveness = Math.abs(probability - 50) * 0.9; // 0 at 50%, up to 45 at 5%/95%
+  const decisiveness = Math.abs(probability - 50) * 0.9;
   const horizonPenalty = Math.min(horizon / 24, 1) * 15;
-  return Math.round(clamp(55 + decisiveness - horizonPenalty, 35, 95));
+
+  return Math.round(
+    clamp(55 + decisiveness - horizonPenalty, 35, 95)
+  );
 }
 
-async function callRemoteModel(zoneId, rainfall1h, rainfall6h, humidity) {
+/**
+ * Call the teammate's remote AI service.
+ *
+ * IMPORTANT:
+ * `zoneName` is deliberately used here instead of the local Prisma
+ * `zone.id`.
+ *
+ * The AI dataset uses `canton_nom` as its zone identifier.
+ *
+ * @param {string} zoneName
+ * @param {number} rainfall1h
+ * @param {number} rainfall6h
+ * @param {number} humidity
+ */
+async function callRemoteModel(
+  zoneName,
+  rainfall1h,
+  rainfall6h,
+  humidity
+) {
+  if (!zoneName) {
+    throw new Error(
+      'AIProvider — impossible de déterminer le nom de la zone'
+    );
+  }
+
   const url = `${env.aiApiUrl.replace(/\/$/, '')}/predict`;
+
   let res;
+
   try {
     res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(env.aiApiKey ? { Authorization: `Bearer ${env.aiApiKey}` } : {}),
+
+        ...(env.aiApiKey
+          ? {
+              Authorization: `Bearer ${env.aiApiKey}`,
+            }
+          : {}),
       },
+
       body: JSON.stringify({
-        zone_id: zoneId,
+        // IMPORTANT:
+        // The remote AI expects the canton/zone name, not our Prisma ID.
+        zone_id: zoneName,
+
         rainfall_1h: rainfall1h,
         rainfall_6h: rainfall6h,
         humidity: humidity ?? 0,
       }),
     });
   } catch (err) {
-    throw new Error(`AIProvider injoignable (${url}) — ${err.message}`);
+    throw new Error(
+      `AIProvider injoignable (${url}) — ${err.message}`
+    );
   }
+
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(`AIProvider ${res.status} — ${body.detail ? JSON.stringify(body.detail) : 'erreur inconnue'}`);
+
+    throw new Error(
+      `AIProvider ${res.status} — ${
+        body.detail
+          ? JSON.stringify(body.detail)
+          : 'erreur inconnue'
+      }`
+    );
   }
+
   return res.json();
 }
 
 export const aiService = {
-  // Real mode only requires the URL — the key is optional (see
-  // callRemoteModel: the Authorization header is only sent when a key is
-  // configured). Some deployments of the teammate's service (e.g. an
-  // open Railway endpoint) don't require auth at all.
+  // Real mode only requires AI_API_URL.
+  // The API key remains optional because the teammate's endpoint may not
+  // require authentication.
   isMock: !env.aiApiUrl,
 
   /**
-   * @param {{ id: string, population: number }} zone
-   * @param {{ rainfall: number, humidity?: number }} latestEnv - most recent EnvironmentalData row
-   * @param {{ drainScore: number, historyScore: number }} zoneStats - static zone risk inputs
-   * @param {number} horizon - hours (1, 3, 6, 24...)
+   * @param {{
+   *   id: string,
+   *   name: string,
+   *   population: number
+   * }} zone
+   *
+   * @param {{
+   *   rainfall: number,
+   *   humidity?: number
+   * }} latestEnv
+   *
+   * @param {{
+   *   drainScore: number,
+   *   historyScore: number
+   * }} zoneStats
+   *
+   * @param {number} horizon
    */
-  async generatePrediction(zone, latestEnv, zoneStats, horizon = 6) {
+  async generatePrediction(
+    zone,
+    latestEnv,
+    zoneStats,
+    horizon = 6
+  ) {
     if (!this.isMock) {
       try {
         const rainfall1h = latestEnv?.rainfall ?? 0;
-        // See REMOTE_MODEL_VERSION comment above — flat extrapolation, not a
-        // real rolling 6h sum yet.
+
+        // Temporary approximation until EnvironmentalData supports
+        // a real rolling 6-hour rainfall aggregation.
         const rainfall6h = rainfall1h * 6;
 
-        const remote = await callRemoteModel(zone.id, rainfall1h, rainfall6h, latestEnv?.humidity);
+        // IMPORTANT:
+        // Send zone.name to the remote AI, NOT zone.id.
+        //
+        // Example:
+        //   zone.id   = "cmsqju7290004domk36uafny6"
+        //   zone.name = "Bè"
+        //
+        // The AI expects:
+        //   zone_id = "Bè"
+        const remote = await callRemoteModel(
+          zone.name,
+          rainfall1h,
+          rainfall6h,
+          latestEnv?.humidity
+        );
 
-        // flood_probability's scale isn't pinned down by the OpenAPI schema
-        // (just `number`) — handle both a 0-1 and a 0-100 API without
-        // guessing wrong silently.
-        const rawProbability = Number(remote.flood_probability) || 0;
-        const probability = Math.round(clamp(rawProbability <= 1 ? rawProbability * 100 : rawProbability));
+        // flood_probability may be returned either as:
+        //   0.82
+        // or:
+        //   82
+        //
+        // Normalize both representations to 0–100.
+        const rawProbability =
+          Number(remote.flood_probability) || 0;
+
+        const probability = Math.round(
+          clamp(
+            rawProbability <= 1
+              ? rawProbability * 100
+              : rawProbability
+          )
+        );
+
         const riskLevel = riskTierOf(probability);
-        const confidence = estimateConfidence(probability, horizon);
 
-        // Sanity check only, never overrides riskLevel above — if the
-        // teammate's binary classifier disagrees sharply with our
-        // probability-derived tier (e.g. it says "low" at 70%+), that's
-        // worth knowing about even though we don't act on it here.
-        const binaryLabel = normalizeBinaryLabel(remote.risk_level);
-        if (binaryLabel === 'LOW' && probability >= 55) {
-          console.warn(`[aiService] Zone ${zone.id}: remote model says LOW but probability is ${probability}% (tier ${riskLevel})`);
-        } else if (binaryLabel === 'HIGH' && probability < 30) {
-          console.warn(`[aiService] Zone ${zone.id}: remote model says HIGH but probability is only ${probability}% (tier ${riskLevel})`);
+        const confidence = estimateConfidence(
+          probability,
+          horizon
+        );
+
+        // The remote model provides only a binary HIGH/LOW label.
+        // We keep it only for consistency checking and derive our own
+        // four-level risk tier from flood_probability.
+        const binaryLabel = normalizeBinaryLabel(
+          remote.risk_level
+        );
+
+        if (
+          binaryLabel === 'LOW' &&
+          probability >= 55
+        ) {
+          console.warn(
+            `[aiService] Zone ${zone.name}: remote model says LOW but probability is ${probability}% (tier ${riskLevel})`
+          );
+        } else if (
+          binaryLabel === 'HIGH' &&
+          probability < 30
+        ) {
+          console.warn(
+            `[aiService] Zone ${zone.name}: remote model says HIGH but probability is only ${probability}% (tier ${riskLevel})`
+          );
         }
+
+        console.log(
+          `[aiService] Prédiction distante réussie pour ${zone.name}: ${probability}% (${riskLevel})`
+        );
 
         return {
           modelVersion: REMOTE_MODEL_VERSION,
@@ -146,47 +276,98 @@ export const aiService = {
           probability,
           confidence,
           riskLevel,
-          // The remote API gives no factor breakdown, so the AIPredictions.jsx
-          // waterfall will render an all-zero decomposition for these
-          // predictions rather than fabricated contributions — see
-          // predictionsService.js's existing "not invented" convention on the
-          // frontend side.
+
+          // The remote API does not provide factor contributions.
+          // We therefore do NOT invent them.
           factors: [],
         };
       } catch (err) {
-        // The remote service (teammate's Railway deploy) doesn't yet know
-        // every zone_id we have locally — e.g. it 404s with "Zone inconnue"
-        // for zones created/synced on our side after their model was last
-        // trained/deployed — and it can also simply be down. Either way,
-        // this must never turn into a hard 500 on /predictions/generate:
-        // the dashboard would show nothing instead of a (clearly labeled)
-        // fallback prediction. Fall through to the local MOCK_MODEL_V1
-        // below, but keep the failure visible in modelVersion and logs
-        // rather than silently pretending it was a real remote result
-        // (spec section 33 — never present fabricated data as real).
-        console.warn(`[aiService] AIProvider distant indisponible pour la zone ${zone.id}, repli sur le modèle local: ${err.message}`);
-        const fallback = this._localMockPrediction(zone, latestEnv, zoneStats, horizon);
-        fallback.modelVersion = `${MODEL_VERSION_MOCK}_FALLBACK_REMOTE_UNAVAILABLE`;
+        // If the remote AI is unavailable or does not know the zone,
+        // fall back to the local transparent model.
+        //
+        // The fallback is explicitly labelled so the dashboard never
+        // mistakes it for a real remote AI prediction.
+        console.warn(
+          `[aiService] AIProvider distant indisponible pour la zone ${zone.name}, repli sur le modèle local: ${err.message}`
+        );
+
+        const fallback =
+          this._localMockPrediction(
+            zone,
+            latestEnv,
+            zoneStats,
+            horizon
+          );
+
+        fallback.modelVersion =
+          `${MODEL_VERSION_MOCK}_FALLBACK_REMOTE_UNAVAILABLE`;
+
         return fallback;
       }
     }
 
-    return this._localMockPrediction(zone, latestEnv, zoneStats, horizon);
+    return this._localMockPrediction(
+      zone,
+      latestEnv,
+      zoneStats,
+      horizon
+    );
   },
 
-  _localMockPrediction(zone, latestEnv, zoneStats, horizon = 6) {
-
+  /**
+   * Transparent local fallback.
+   *
+   * This is NOT a machine-learning model.
+   * It exists only so the application remains functional when the remote
+   * inference service cannot be reached.
+   */
+  _localMockPrediction(
+    zone,
+    latestEnv,
+    zoneStats,
+    horizon = 6
+  ) {
     const base = 20;
-    const rainContribution = clamp((latestEnv?.rainfall ?? 0) * 0.6, 0, 45);
-    const drainContribution = clamp(50 - (zoneStats?.drainScore ?? 50), -20, 25) * 0.6;
-    const histContribution = clamp((zoneStats?.historyScore ?? 0) * 0.3, 0, 25);
-    // Horizon dampens confidence and slightly increases projected risk the
-    // further out the forecast goes — a simple, explainable stand-in for a
-    // real time-series model's uncertainty growth.
-    const horizonPenalty = Math.min(horizon / 24, 1) * 8;
 
-    const probability = clamp(base + rainContribution + drainContribution + histContribution + horizonPenalty);
-    const confidence = clamp(96 - horizonPenalty * 1.5 - Math.abs(rainContribution - 20) * 0.1, 40, 99);
+    const rainContribution = clamp(
+      (latestEnv?.rainfall ?? 0) * 0.6,
+      0,
+      45
+    );
+
+    const drainContribution =
+      clamp(
+        50 - (zoneStats?.drainScore ?? 50),
+        -20,
+        25
+      ) * 0.6;
+
+    const histContribution = clamp(
+      (zoneStats?.historyScore ?? 0) * 0.3,
+      0,
+      25
+    );
+
+    // Further horizons slightly increase projected risk while reducing
+    // confidence.
+    const horizonPenalty =
+      Math.min(horizon / 24, 1) * 8;
+
+    const probability = clamp(
+      base +
+        rainContribution +
+        drainContribution +
+        histContribution +
+        horizonPenalty
+    );
+
+    const confidence = clamp(
+      96 -
+        horizonPenalty * 1.5 -
+        Math.abs(rainContribution - 20) * 0.1,
+      40,
+      99
+    );
 
     const riskLevel = riskTierOf(probability);
 
@@ -196,11 +377,39 @@ export const aiService = {
       probability: Math.round(probability),
       confidence: Math.round(confidence),
       riskLevel,
+
       factors: [
-        { factor: 'rainfall', value: latestEnv?.rainfall ?? 0, contribution: Math.round(rainContribution) },
-        { factor: 'drainage', value: zoneStats?.drainScore ?? 50, contribution: Math.round(drainContribution) },
-        { factor: 'history', value: zoneStats?.historyScore ?? 0, contribution: Math.round(histContribution) },
-        { factor: 'base', value: base, contribution: base },
+        {
+          factor: 'rainfall',
+          value: latestEnv?.rainfall ?? 0,
+          contribution: Math.round(
+            rainContribution
+          ),
+        },
+
+        {
+          factor: 'drainage',
+          value:
+            zoneStats?.drainScore ?? 50,
+          contribution: Math.round(
+            drainContribution
+          ),
+        },
+
+        {
+          factor: 'history',
+          value:
+            zoneStats?.historyScore ?? 0,
+          contribution: Math.round(
+            histContribution
+          ),
+        },
+
+        {
+          factor: 'base',
+          value: base,
+          contribution: base,
+        },
       ],
     };
   },
