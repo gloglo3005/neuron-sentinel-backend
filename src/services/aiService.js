@@ -1,5 +1,38 @@
 import { env } from '../config/env.js';
 
+// Nos 13 quartiers (backend/prisma/seed.js) et les 13 cantons du modèle
+// distant (data/processed/lome_fri.gpkg côté service IA) ne sont pas le
+// même découpage administratif : nos quartiers ("villes") sont plus fins
+// que les cantons du Grand Lomé utilisés par le modèle. Seuls deux noms
+// coïncidaient par hasard (Amoutivé, Baguida) — les 11 autres quartiers
+// renvoyaient 404 côté service distant et retombaient silencieusement sur
+// le mock local.
+//
+// Cette table n'est PAS une supposition : elle vient d'un vrai test
+// point-dans-polygone entre les coordonnées de chaque quartier (seed.js)
+// et les polygones réels des cantons (lome_fri.gpkg, reprojetés
+// UTM31N -> comparés en mètres). 12/13 quartiers tombent littéralement
+// à l'intérieur d'un polygone de canton ; Baguida n'est pas contenu au
+// sens strict (à 2,75 km du centroïde du canton Baguida) mais matche par
+// nom ET reste de très loin le plus proche, ce qui confirme le calcul.
+// Si le découpage venait à changer côté service IA, cette table devra
+// être régénérée de la même façon plutôt que corrigée à la main.
+const ZONE_TO_CANTON = {
+  'Bè': 'Amoutivé',
+  'Kodjoviakopé': 'Amoutivé',
+  'Amoutivé': 'Amoutivé',
+  'Tokoin': 'Bè-Ouest',
+  'Djidjolé': 'Bè-Ouest',
+  'Adidogomé': 'Aflao-Gakli',
+  'Agoè': 'Bè-Ouest',
+  'Baguida': 'Baguida',
+  'Hédzranawoé': 'Bè-Centre',
+  'Nyékonakpoè': 'Amoutivé',
+  'Akodesséwa': 'Bè-Est',
+  'Doulassamé': 'Amoutivé',
+  'Hanoukopé': 'Amoutivé',
+};
+
 // AIProvider interface (spec section 28): generatePrediction(zone, envData).
 //
 // MOCK_MODEL_V1 is a simple, fully transparent scoring function — not a
@@ -94,25 +127,28 @@ function estimateConfidence(probability, horizon) {
  * Call the teammate's remote AI service.
  *
  * IMPORTANT:
- * `zoneName` is deliberately used here instead of the local Prisma
- * `zone.id`.
+ * `cantonName` is deliberately used here instead of the local Prisma
+ * `zone.id` — AND instead of the raw local `zone.name`.
  *
- * The AI dataset uses `canton_nom` as its zone identifier.
+ * The AI dataset uses `canton_nom` as its zone identifier, and our
+ * quartiers don't share the same boundaries as the AI's cantons (see
+ * ZONE_TO_CANTON above). The caller is responsible for translating
+ * zone.name through ZONE_TO_CANTON before calling this function.
  *
- * @param {string} zoneName
+ * @param {string} cantonName
  * @param {number} rainfall1h
  * @param {number} rainfall6h
  * @param {number} humidity
  */
 async function callRemoteModel(
-  zoneName,
+  cantonName,
   rainfall1h,
   rainfall6h,
   humidity
 ) {
-  if (!zoneName) {
+  if (!cantonName) {
     throw new Error(
-      'AIProvider — impossible de déterminer le nom de la zone'
+      'AIProvider — impossible de déterminer le canton correspondant à cette zone'
     );
   }
 
@@ -135,8 +171,9 @@ async function callRemoteModel(
 
       body: JSON.stringify({
         // IMPORTANT:
-        // The remote AI expects the canton/zone name, not our Prisma ID.
-        zone_id: zoneName,
+        // The remote AI expects the canton name (see ZONE_TO_CANTON), not
+        // our Prisma ID and not our raw quartier name.
+        zone_id: cantonName,
 
         rainfall_1h: rainfall1h,
         rainfall_6h: rainfall6h,
@@ -204,16 +241,24 @@ export const aiService = {
         const rainfall6h = rainfall1h * 6;
 
         // IMPORTANT:
-        // Send zone.name to the remote AI, NOT zone.id.
+        // Send the CANTON name to the remote AI, NOT zone.id and NOT the
+        // raw zone.name — our quartiers and the AI's cantons are two
+        // different administrative breakdowns (see ZONE_TO_CANTON above).
         //
         // Example:
-        //   zone.id   = "cmsqju7290004domk36uafny6"
-        //   zone.name = "Bè"
-        //
-        // The AI expects:
-        //   zone_id = "Bè"
+        //   zone.id       = "cmsqju7290004domk36uafny6"
+        //   zone.name     = "Bè"        (notre quartier)
+        //   canton envoyé = "Amoutivé"  (canton réel qui le contient)
+        const cantonName = ZONE_TO_CANTON[zone.name];
+        if (!cantonName) {
+          throw new Error(
+            `Aucun canton connu pour le quartier "${zone.name}" — ` +
+              'ZONE_TO_CANTON doit être complétée si de nouveaux quartiers sont ajoutés.'
+          );
+        }
+
         const remote = await callRemoteModel(
-          zone.name,
+          cantonName,
           rainfall1h,
           rainfall6h,
           latestEnv?.humidity
