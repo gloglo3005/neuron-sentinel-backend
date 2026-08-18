@@ -1,9 +1,17 @@
 import { prisma } from '../config/db.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 // GET /api/dashboard/summary
 // Backs Dashboard.jsx's KPI cards. Everything here is a live aggregate —
 // nothing is hard-coded, per spec section 5.
-export async function getDashboardSummary(req, res) {
+//
+// Wrapped in asyncHandler (was previously a bare async function): without
+// it, a rejected promise here (e.g. a dropped DB connection) becomes an
+// unhandled promise rejection instead of reaching errorHandler — and since
+// Node 15+, an unhandled rejection terminates the whole process by
+// default, taking down the backend for every connected client, not just
+// this one request.
+export const getDashboardSummary = asyncHandler(async (req, res) => {
   const [zones, openAlerts, recentPredictions] = await Promise.all([
     prisma.zone.findMany({ select: { riskLevel: true, population: true } }),
     prisma.alert.findMany({
@@ -42,4 +50,4 @@ export async function getDashboardSummary(req, res) {
     avgModelConfidence: avgConfidence,
     lastUpdate,
   });
-}
+});

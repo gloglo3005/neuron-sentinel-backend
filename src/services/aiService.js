@@ -99,9 +99,11 @@ async function callRemoteModel(zoneId, rainfall1h, rainfall6h, humidity) {
 }
 
 export const aiService = {
-  // Real mode requires both the key and the URL — matches the pattern
-  // documented in env.js ("any of these being empty means MOCK mode").
-  isMock: !env.aiApiKey || !env.aiApiUrl,
+  // Real mode only requires the URL — the key is optional (see
+  // callRemoteModel: the Authorization header is only sent when a key is
+  // configured). Some deployments of the teammate's service (e.g. an
+  // open Railway endpoint) don't require auth at all.
+  isMock: !env.aiApiUrl,
 
   /**
    * @param {{ id: string, population: number }} zone

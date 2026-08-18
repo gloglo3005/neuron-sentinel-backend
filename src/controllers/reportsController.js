@@ -13,6 +13,7 @@ export const listReports = asyncHandler(async (req, res) => {
       interventions: { include: { teams: { include: { team: true } } } },
       createdBy: { select: { name: true, role: true } },
       validatedBy: { select: { name: true, role: true } },
+      damageReports: true,
     },
     orderBy: { createdAt: 'desc' },
     take: 100,
@@ -36,6 +37,7 @@ export const createReport = asyncHandler(async (req, res) => {
     damages.map((d) =>
       prisma.damageReport.create({
         data: {
+          alertId: alert.id,
           type: d.type, quantity: d.quantity ?? null, severity: d.severity, source: d.source || 'Autorité',
           infrastructureId: d.infrastructureId || null, verified: true, verifiedById: req.user.id,
         },

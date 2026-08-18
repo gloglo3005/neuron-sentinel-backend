@@ -171,6 +171,7 @@ model Alert {
   zones           AlertZone[]
   interventions   Intervention[]
   notifications   Notification[]
+  damageReports   DamageReport[]
 
   @@index([status])
 }
@@ -332,6 +333,7 @@ model Infrastructure {
 
 model DamageReport {
   id               String          @id @default(cuid())
+  alertId          String?
   emergencyEventId String?
   infrastructureId String?
   type             String
@@ -341,9 +343,12 @@ model DamageReport {
   verified         Boolean         @default(false)
   verifiedById     String?
   createdAt        DateTime        @default(now())
+  alert            Alert?          @relation(fields: [alertId], references: [id], onDelete: Cascade)
   emergencyEvent   EmergencyEvent? @relation(fields: [emergencyEventId], references: [id])
   infrastructure   Infrastructure? @relation(fields: [infrastructureId], references: [id])
   verifiedBy       User?           @relation("DamageVerifiedBy", fields: [verifiedById], references: [id])
+
+  @@index([alertId])
 }
 
 model AuditLog {

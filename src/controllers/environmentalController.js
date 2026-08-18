@@ -1,10 +1,13 @@
 import { prisma } from '../config/db.js';
 import { weatherService } from '../services/weatherService.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 // GET /api/environmental-data?zoneId=&from=&to=&limit=
 // Always returns the history, never just the latest reading (spec section
 // 18 — "ne pas conserver uniquement la dernière mesure").
-export async function listEnvironmentalData(req, res) {
+// Wrapped in asyncHandler — see dashboardController.js for why this
+// matters (unhandled rejection = whole process crashes on Node 15+).
+export const listEnvironmentalData = asyncHandler(async (req, res) => {
   const { zoneId, from, to } = req.query;
   const limit = Math.min(Number(req.query.limit) || 200, 500);
 
@@ -23,7 +26,7 @@ export async function listEnvironmentalData(req, res) {
     include: { zone: { select: { name: true } } },
   });
   res.json(rows);
-}
+});
 
 // Pulls one current-weather reading per zone from the configured
 // WeatherProvider (real OpenWeatherMap if WEATHER_API_KEY is set, MOCK
@@ -56,6 +59,6 @@ export async function runWeatherSync() {
 
 // POST /api/environmental-data/sync — manual trigger (e.g. a "Sync now"
 // button before a demo), reusing the same logic as the interval.
-export async function syncEnvironmentalData(req, res) {
+export const syncEnvironmentalData = asyncHandler(async (req, res) => {
   res.json(await runWeatherSync());
-}
+});
