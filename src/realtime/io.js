@@ -1,10 +1,21 @@
 import { Server } from 'socket.io';
-import { env } from '../config/env.js';
+import { isAllowedOrigin } from '../config/corsOrigins.js';
 
 let io = null;
 
 export function initSocket(httpServer) {
-  io = new Server(httpServer, { cors: { origin: env.corsOrigin } });
+  io = new Server(httpServer, {
+    cors: {
+      origin: (origin, callback) => {
+        if (isAllowedOrigin(origin)) {
+          callback(null, true);
+        } else {
+          callback(new Error(`Origin ${origin} not allowed by CORS`));
+        }
+      },
+      credentials: true,
+    },
+  });
   io.on('connection', (socket) => {
     // No per-user rooms yet — every connected dashboard client gets every
     // event. Fine for a handful of concurrent authorities in the MVP;
