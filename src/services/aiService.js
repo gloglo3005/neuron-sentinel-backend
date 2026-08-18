@@ -113,46 +113,68 @@ export const aiService = {
    */
   async generatePrediction(zone, latestEnv, zoneStats, horizon = 6) {
     if (!this.isMock) {
-      const rainfall1h = latestEnv?.rainfall ?? 0;
-      // See REMOTE_MODEL_VERSION comment above — flat extrapolation, not a
-      // real rolling 6h sum yet.
-      const rainfall6h = rainfall1h * 6;
+      try {
+        const rainfall1h = latestEnv?.rainfall ?? 0;
+        // See REMOTE_MODEL_VERSION comment above — flat extrapolation, not a
+        // real rolling 6h sum yet.
+        const rainfall6h = rainfall1h * 6;
 
-      const remote = await callRemoteModel(zone.id, rainfall1h, rainfall6h, latestEnv?.humidity);
+        const remote = await callRemoteModel(zone.id, rainfall1h, rainfall6h, latestEnv?.humidity);
 
-      // flood_probability's scale isn't pinned down by the OpenAPI schema
-      // (just `number`) — handle both a 0-1 and a 0-100 API without
-      // guessing wrong silently.
-      const rawProbability = Number(remote.flood_probability) || 0;
-      const probability = Math.round(clamp(rawProbability <= 1 ? rawProbability * 100 : rawProbability));
-      const riskLevel = riskTierOf(probability);
-      const confidence = estimateConfidence(probability, horizon);
+        // flood_probability's scale isn't pinned down by the OpenAPI schema
+        // (just `number`) — handle both a 0-1 and a 0-100 API without
+        // guessing wrong silently.
+        const rawProbability = Number(remote.flood_probability) || 0;
+        const probability = Math.round(clamp(rawProbability <= 1 ? rawProbability * 100 : rawProbability));
+        const riskLevel = riskTierOf(probability);
+        const confidence = estimateConfidence(probability, horizon);
 
-      // Sanity check only, never overrides riskLevel above — if the
-      // teammate's binary classifier disagrees sharply with our
-      // probability-derived tier (e.g. it says "low" at 70%+), that's
-      // worth knowing about even though we don't act on it here.
-      const binaryLabel = normalizeBinaryLabel(remote.risk_level);
-      if (binaryLabel === 'LOW' && probability >= 55) {
-        console.warn(`[aiService] Zone ${zone.id}: remote model says LOW but probability is ${probability}% (tier ${riskLevel})`);
-      } else if (binaryLabel === 'HIGH' && probability < 30) {
-        console.warn(`[aiService] Zone ${zone.id}: remote model says HIGH but probability is only ${probability}% (tier ${riskLevel})`);
+        // Sanity check only, never overrides riskLevel above — if the
+        // teammate's binary classifier disagrees sharply with our
+        // probability-derived tier (e.g. it says "low" at 70%+), that's
+        // worth knowing about even though we don't act on it here.
+        const binaryLabel = normalizeBinaryLabel(remote.risk_level);
+        if (binaryLabel === 'LOW' && probability >= 55) {
+          console.warn(`[aiService] Zone ${zone.id}: remote model says LOW but probability is ${probability}% (tier ${riskLevel})`);
+        } else if (binaryLabel === 'HIGH' && probability < 30) {
+          console.warn(`[aiService] Zone ${zone.id}: remote model says HIGH but probability is only ${probability}% (tier ${riskLevel})`);
+        }
+
+        return {
+          modelVersion: REMOTE_MODEL_VERSION,
+          horizon,
+          probability,
+          confidence,
+          riskLevel,
+          // The remote API gives no factor breakdown, so the AIPredictions.jsx
+          // waterfall will render an all-zero decomposition for these
+          // predictions rather than fabricated contributions — see
+          // predictionsService.js's existing "not invented" convention on the
+          // frontend side.
+          factors: [],
+        };
+      } catch (err) {
+        // The remote service (teammate's Railway deploy) doesn't yet know
+        // every zone_id we have locally — e.g. it 404s with "Zone inconnue"
+        // for zones created/synced on our side after their model was last
+        // trained/deployed — and it can also simply be down. Either way,
+        // this must never turn into a hard 500 on /predictions/generate:
+        // the dashboard would show nothing instead of a (clearly labeled)
+        // fallback prediction. Fall through to the local MOCK_MODEL_V1
+        // below, but keep the failure visible in modelVersion and logs
+        // rather than silently pretending it was a real remote result
+        // (spec section 33 — never present fabricated data as real).
+        console.warn(`[aiService] AIProvider distant indisponible pour la zone ${zone.id}, repli sur le modèle local: ${err.message}`);
+        const fallback = this._localMockPrediction(zone, latestEnv, zoneStats, horizon);
+        fallback.modelVersion = `${MODEL_VERSION_MOCK}_FALLBACK_REMOTE_UNAVAILABLE`;
+        return fallback;
       }
-
-      return {
-        modelVersion: REMOTE_MODEL_VERSION,
-        horizon,
-        probability,
-        confidence,
-        riskLevel,
-        // The remote API gives no factor breakdown, so the AIPredictions.jsx
-        // waterfall will render an all-zero decomposition for these
-        // predictions rather than fabricated contributions — see
-        // predictionsService.js's existing "not invented" convention on the
-        // frontend side.
-        factors: [],
-      };
     }
+
+    return this._localMockPrediction(zone, latestEnv, zoneStats, horizon);
+  },
+
+  _localMockPrediction(zone, latestEnv, zoneStats, horizon = 6) {
 
     const base = 20;
     const rainContribution = clamp((latestEnv?.rainfall ?? 0) * 0.6, 0, 45);
